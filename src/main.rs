@@ -1,3 +1,11 @@
+mod model;
+
+use model::NormalizedGraph;
+
 fn main() {
-    println!("Hello, world!");
+    let model = NormalizedGraph::default();
+    println!(
+        "txviz normalized model initialized: {}",
+        model.format_version
+    );
 }
