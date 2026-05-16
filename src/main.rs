@@ -4,6 +4,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::{error::Error, fmt, fs, io::Write, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
+use model::{
+    AmountDisplay, NormalizedAmount, NormalizedAnnotations, NormalizedGraph, NormalizedInput,
+    NormalizedLockTime, NormalizedOutput, NormalizedSequence, NormalizedSpendRef,
+    NormalizedTransaction, ResolvedPrevout, TransactionSource, TransactionSourceMode,
+    TransactionStatus,
+};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -120,7 +126,8 @@ impl Default for RenderConfig {
     }
 }
 
-#[derive(Clone)]
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TxDoc {
     id: String,
     creation_index: usize,
@@ -130,11 +137,11 @@ struct TxDoc {
     inputs: Vec<InputDoc>,
     outputs: Vec<OutputDoc>,
 }
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct InputDoc {
     spends: Option<SpendRef>,
 }
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OutputDoc {
     out_uid: String,
     creation_index: usize,
@@ -142,7 +149,7 @@ struct OutputDoc {
     value: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SpendRef {
     tx_ref: String,
     vout: usize,
@@ -192,7 +199,8 @@ fn write_output(request: &OperationRequest) -> Result<(), CliError> {
             source,
         })?;
     let generator = format_generator_label(&request.inputs);
-    let txs = parse_transactions(request).map_err(CliError::ParseDomain)?;
+    let graph = parse_normalized_graph(request).map_err(CliError::ParseDomain)?;
+    let txs = project_render_transactions(&graph.transactions);
     let wr = match request.format {
         OutputFormat::Html => emit_html(&mut output, &generator, &txs),
         OutputFormat::Svg => emit_svg(&mut output, &generator, &txs),
@@ -203,7 +211,7 @@ fn write_output(request: &OperationRequest) -> Result<(), CliError> {
     })
 }
 
-fn parse_transactions(request: &OperationRequest) -> Result<Vec<TxDoc>, String> {
+fn parse_normalized_graph(request: &OperationRequest) -> Result<NormalizedGraph, String> {
     let mut txs = Vec::new();
     let mut tx_counter = 0usize;
     let mut out_counter = 0usize;
@@ -225,19 +233,40 @@ fn parse_transactions(request: &OperationRequest) -> Result<Vec<TxDoc>, String> 
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or_else(|| tx.get("title").and_then(Value::as_str).map(str::to_owned));
-            let version = tx.get("version").and_then(Value::as_i64);
-            let locktime = tx.get("locktime").cloned();
+            let version = tx.get("version").and_then(Value::as_u64).map(|v| v as u32);
+            let locktime = NormalizedLockTime::default();
             let inputs = tx
                 .get("inputs")
                 .and_then(Value::as_array)
                 .map(|a| {
                     a.iter()
-                        .map(|i| {
-                            let spends = i
-                                .get("spends")
-                                .and_then(Value::as_str)
-                                .and_then(parse_spend_ref);
-                            InputDoc { spends }
+                        .enumerate()
+                        .map(|(vin, i)| {
+                            let spends = i.get("spends").and_then(Value::as_str);
+                            let spends_ref = spends
+                                .map(|raw| {
+                                    parse_spend_ref(raw).map_or(
+                                        NormalizedSpendRef::Invalid {
+                                            raw: Some(raw.to_owned()),
+                                        },
+                                        |s| NormalizedSpendRef::Symbolic {
+                                            raw: raw.to_owned(),
+                                            tx_ref: s.tx_ref,
+                                            vout: s.vout as u32,
+                                        },
+                                    )
+                                })
+                                .unwrap_or(NormalizedSpendRef::None);
+                            NormalizedInput {
+                                in_uid: format!("{tx_id}:in:{vin}"),
+                                vin: vin as u32,
+                                spends_ref,
+                                resolved_prevout: ResolvedPrevout::Dangling,
+                                sequence: NormalizedSequence::default(),
+                                annotations: NormalizedAnnotations::default(),
+                                classes: Vec::new(),
+                                style: None,
+                            }
                         })
                         .collect()
                 })
@@ -258,41 +287,107 @@ fn parse_transactions(request: &OperationRequest) -> Result<Vec<TxDoc>, String> 
                                     o.get("title").and_then(Value::as_str).map(str::to_owned)
                                 })
                                 .unwrap_or_else(|| format!("output {i}"));
-                            let value = o
-                                .get("amount_sat")
-                                .and_then(Value::as_u64)
-                                .map(|v| format!("{v} sat"))
-                                .or_else(|| {
-                                    o.get("amount_expr")
-                                        .and_then(Value::as_str)
-                                        .map(str::to_owned)
-                                });
+                            let amount_sat = o.get("amount_sat").and_then(Value::as_u64);
+                            let amount_expr = o
+                                .get("amount_expr")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
                             let out_uid = format!("{tx_id}:{i}");
                             let creation_index = out_counter;
                             out_counter += 1;
-                            OutputDoc {
+                            NormalizedOutput {
                                 out_uid,
-                                creation_index,
-                                title,
-                                value,
+                                vout: i as u32,
+                                amount: NormalizedAmount {
+                                    amount_sat,
+                                    amount_expr,
+                                    display_primary: AmountDisplay::Sat,
+                                    display_secondary: AmountDisplay::Expr,
+                                },
+                                descriptor: Some(title),
+                                is_spent: false,
+                                spent_by: Vec::new(),
+                                annotations: NormalizedAnnotations::default(),
+                                classes: vec![creation_index.to_string()],
+                                style: None,
                             }
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            txs.push(TxDoc {
-                id: tx_id,
-                creation_index: tx_counter,
-                title,
+            txs.push(NormalizedTransaction {
+                tx_uid: tx_id.clone(),
+                symbolic_id: Some(tx_id),
+                txid: None,
+                source_mode: TransactionSourceMode::Symbolic,
+                status: TransactionStatus::Unknown,
                 version,
                 locktime,
                 inputs,
                 outputs,
+                annotations: NormalizedAnnotations {
+                    title,
+                    ..NormalizedAnnotations::default()
+                },
+                classes: vec![tx_counter.to_string()],
+                style: None,
+                source: TransactionSource {
+                    raw_hex: None,
+                    author_index: tx_counter as u32,
+                    author_keys: Vec::new(),
+                },
             });
             tx_counter += 1;
         }
     }
-    Ok(txs)
+    let mut graph = NormalizedGraph::default();
+    graph.transactions = txs;
+    Ok(graph)
+}
+
+fn project_render_transactions(transactions: &[NormalizedTransaction]) -> Vec<TxDoc> {
+    transactions
+        .iter()
+        .enumerate()
+        .map(|(tx_idx, tx)| TxDoc {
+            id: tx.symbolic_id.clone().unwrap_or_else(|| tx.tx_uid.clone()),
+            creation_index: tx_idx,
+            title: tx.annotations.title.clone(),
+            version: tx.version.map(|v| v as i64),
+            locktime: None,
+            inputs: tx
+                .inputs
+                .iter()
+                .map(|i| InputDoc {
+                    spends: match &i.spends_ref {
+                        NormalizedSpendRef::Symbolic { tx_ref, vout, .. } => Some(SpendRef {
+                            tx_ref: tx_ref.clone(),
+                            vout: *vout as usize,
+                        }),
+                        _ => None,
+                    },
+                })
+                .collect(),
+            outputs: tx
+                .outputs
+                .iter()
+                .enumerate()
+                .map(|(i, o)| OutputDoc {
+                    out_uid: o.out_uid.clone(),
+                    creation_index: i,
+                    title: o
+                        .descriptor
+                        .clone()
+                        .unwrap_or_else(|| format!("output {}", o.vout)),
+                    value: o
+                        .amount
+                        .amount_sat
+                        .map(|v| format!("{v} sat"))
+                        .or_else(|| o.amount.amount_expr.clone()),
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 fn parse_spend_ref(raw: &str) -> Option<SpendRef> {
@@ -625,7 +720,7 @@ mod tests {
             inputs: vec![InputDoc { spends: None }],
             outputs: vec![],
         };
-        let (_svg, h, _w) = layout_tx(&tx, &cfg, &TextMeasurer, 20.0, 20.0);
+        let (_svg, h, _w, _inputs, _outputs) = layout_tx(&tx, &cfg, &TextMeasurer, 20.0, 20.0);
         assert!(h > 0.0);
     }
 }
