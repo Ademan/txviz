@@ -1,7 +1,7 @@
 mod model;
 
-use std::{error::Error, fmt, fs, io::Write, path::PathBuf};
 use std::collections::{BTreeSet, HashMap};
+use std::{error::Error, fmt, fs, io::Write, path::PathBuf};
 
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
@@ -328,29 +328,65 @@ fn emit_svg(mut writer: impl Write, generator: &str, txs: &[TxDoc]) -> std::io::
     let columns = build_layout_columns(txs).unwrap_or_else(|_| vec![txs.iter().collect()]);
     let mut max_y: f32 = 0.0;
     let mut groups = String::new();
+    let mut links = String::new();
     let mut max_w: f32 = 0.0;
+    let mut output_anchors: HashMap<(String, usize), (f32, f32)> = HashMap::new();
+    let mut input_anchors: Vec<(Option<SpendRef>, f32, f32)> = Vec::new();
     for (column_idx, col) in columns.iter().enumerate() {
         let mut y = 20.0;
         let x = 20.0 + column_idx as f32 * (cfg.tx_max_width + 120.0);
         for tx in col {
-            let (g, h, w) = layout_tx(tx, &cfg, &m, x, y);
+            let (g, h, w, in_anchors, out_anchors) = layout_tx(tx, &cfg, &m, x, y);
             y += h + cfg.tx_gap_y;
             max_w = max_w.max(x + w + 40.0);
             groups.push_str(&g);
+            for (idx, (ox, oy)) in out_anchors.into_iter().enumerate() {
+                output_anchors.insert((tx.id.clone(), idx), (ox, oy));
+            }
+            for (idx, (ix, iy)) in in_anchors.into_iter().enumerate() {
+                input_anchors.push((tx.inputs[idx].spends.clone(), ix, iy));
+            }
         }
         max_y = max_y.max(y);
     }
+    links.push_str(
+        "  <g class=\"spend-links\" fill=\"none\" stroke=\"black\" stroke-width=\"1\">\n",
+    );
+    for (spends, input_left, input_y) in input_anchors {
+        if let Some(spend_ref) = spends {
+            if let Some((output_right, output_y)) =
+                output_anchors.get(&(spend_ref.tx_ref, spend_ref.vout))
+            {
+                let separation = input_left - output_right;
+                let control_offset = separation / 3.0;
+                let c1x = output_right + control_offset;
+                let c2x = input_left - control_offset;
+                links.push_str(&format!(
+                    "    <path class=\"spend-link\" d=\"M {} {} C {} {}, {} {}, {} {}\"/>\n",
+                    output_right, output_y, c1x, output_y, c2x, input_y, input_left, input_y
+                ));
+            }
+        }
+    }
+    links.push_str("  </g>\n");
     write!(
         writer,
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"{}\" height=\"{}\">\n  <metadata>{}</metadata>\n{}\n</svg>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"{}\" height=\"{}\">\n  <metadata>{}</metadata>\n{}{}\n</svg>\n",
         max_w.max(200.0),
         max_y.max(120.0),
         html_escape::encode_text(generator),
+        links,
         groups
     )
 }
 
-fn layout_tx(tx: &TxDoc, c: &RenderConfig, m: &TextMeasurer, left: f32, top: f32) -> (String, f32, f32) {
+fn layout_tx(
+    tx: &TxDoc,
+    c: &RenderConfig,
+    m: &TextMeasurer,
+    left: f32,
+    top: f32,
+) -> (String, f32, f32, Vec<(f32, f32)>, Vec<(f32, f32)>) {
     let header = if tx.version.is_some() || tx.locktime.is_some() {
         c.line_height
     } else {
@@ -414,13 +450,17 @@ fn layout_tx(tx: &TxDoc, c: &RenderConfig, m: &TextMeasurer, left: f32, top: f32
         s.push_str(&format!("      <g class=\"tx-header\"><text x=\"{}\" y=\"{}\" fill=\"none\" stroke=\"black\" stroke-width=\"1\">{}</text></g>\n",left+12.0,top+14.0,html_escape::encode_text(&hdr)));
     }
     s.push_str("      <g class=\"tx-inputs\">\n");
+    let mut input_anchors = Vec::new();
     for i in 0..tx.inputs.len() {
         let y = io_y + i as f32 * (input_h + c.input_row_gap);
-        s.push_str(&format!("        <g><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"none\" stroke=\"black\" stroke-width=\"1\"/></g>\n",left+c.input_inset_left,y,input_w,input_h));
+        let input_left = left + c.input_inset_left;
+        s.push_str(&format!("        <g><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"none\" stroke=\"black\" stroke-width=\"1\"/></g>\n",input_left,y,input_w,input_h));
+        input_anchors.push((input_left, y + input_h / 2.0));
     }
     s.push_str("      </g>\n");
     s.push_str("      <g class=\"tx-outputs\">\n");
     let out_left = right - c.output_inset_right - out_w.max(60.0);
+    let mut output_anchors = Vec::new();
     for (j, o) in tx.outputs.iter().enumerate() {
         let y = io_y + j as f32 * (out_h + c.output_row_gap);
         let ow = out_w.max(60.0);
@@ -429,9 +469,10 @@ fn layout_tx(tx: &TxDoc, c: &RenderConfig, m: &TextMeasurer, left: f32, top: f32
             s.push_str(&format!("<text x=\"{}\" y=\"{}\" text-anchor=\"end\" fill=\"none\" stroke=\"black\" stroke-width=\"1\">{}</text>",out_left+ow-c.output_pad_x,y+c.output_pad_y+c.line_height-3.0,html_escape::encode_text(v)));
         }
         s.push_str("</g>\n");
+        output_anchors.push((out_left + ow, y + out_h / 2.0));
     }
     s.push_str("      </g>\n    </g>\n  </g>\n");
-    (s, tx_h, tx_w)
+    (s, tx_h, tx_w, input_anchors, output_anchors)
 }
 
 fn build_layout_columns<'a>(txs: &'a [TxDoc]) -> Result<Vec<Vec<&'a TxDoc>>, String> {
@@ -452,14 +493,22 @@ fn build_layout_columns<'a>(txs: &'a [TxDoc]) -> Result<Vec<Vec<&'a TxDoc>>, Str
 
     let mut no_input: Vec<&TxDoc> = txs
         .iter()
-        .filter(|tx| !tx.inputs.iter().any(|i| i.spends.as_ref().is_some_and(|s| id_to_tx.contains_key(s.tx_ref.as_str()))))
+        .filter(|tx| {
+            !tx.inputs.iter().any(|i| {
+                i.spends
+                    .as_ref()
+                    .is_some_and(|s| id_to_tx.contains_key(s.tx_ref.as_str()))
+            })
+        })
         .collect();
     no_input.sort_by_key(|t| t.creation_index);
     for tx in &no_input {
         remaining.remove(tx.id.as_str());
         laid_out.insert(tx.id.as_str());
     }
-    if !no_input.is_empty() { columns.push(no_input); }
+    if !no_input.is_empty() {
+        columns.push(no_input);
+    }
 
     while !remaining.is_empty() {
         let mut candidate_ids: BTreeSet<&str> = BTreeSet::new();
@@ -467,9 +516,15 @@ fn build_layout_columns<'a>(txs: &'a [TxDoc]) -> Result<Vec<Vec<&'a TxDoc>>, Str
             if let Some(parent) = id_to_tx.get(parent_id) {
                 for out in &parent.outputs {
                     for tx in txs.iter().filter(|tx| {
-                        tx.inputs.iter().any(|i| i.spends.as_ref().is_some_and(|s| format!("{}:{}", s.tx_ref, s.vout) == out.out_uid))
+                        tx.inputs.iter().any(|i| {
+                            i.spends
+                                .as_ref()
+                                .is_some_and(|s| format!("{}:{}", s.tx_ref, s.vout) == out.out_uid)
+                        })
                     }) {
-                        if remaining.contains(tx.id.as_str()) { candidate_ids.insert(tx.id.as_str()); }
+                        if remaining.contains(tx.id.as_str()) {
+                            candidate_ids.insert(tx.id.as_str());
+                        }
                     }
                 }
             }
@@ -477,14 +532,26 @@ fn build_layout_columns<'a>(txs: &'a [TxDoc]) -> Result<Vec<Vec<&'a TxDoc>>, Str
         let mut next: Vec<&TxDoc> = candidate_ids
             .into_iter()
             .filter_map(|id| id_to_tx.get(id).copied())
-            .filter(|tx| tx.inputs.iter().all(|i| i.spends.as_ref().is_none_or(|s| !id_to_tx.contains_key(s.tx_ref.as_str()) || laid_out.contains(s.tx_ref.as_str()))))
+            .filter(|tx| {
+                tx.inputs.iter().all(|i| {
+                    i.spends.as_ref().is_none_or(|s| {
+                        !id_to_tx.contains_key(s.tx_ref.as_str())
+                            || laid_out.contains(s.tx_ref.as_str())
+                    })
+                })
+            })
             .collect();
 
         if next.is_empty() {
             return Err("unsatisfied transaction dependencies".to_string());
         }
 
-        let tx_row: HashMap<&str, usize> = columns.iter().flatten().enumerate().map(|(i, tx)| (tx.id.as_str(), i)).collect();
+        let tx_row: HashMap<&str, usize> = columns
+            .iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, tx)| (tx.id.as_str(), i))
+            .collect();
         next.sort_by_key(|tx| {
             let spends_tx_key = tx
                 .inputs
@@ -503,7 +570,10 @@ fn build_layout_columns<'a>(txs: &'a [TxDoc]) -> Result<Vec<Vec<&'a TxDoc>>, Str
             (spends_tx_key, spends_out_key, tx.creation_index)
         });
 
-        for tx in &next { remaining.remove(tx.id.as_str()); laid_out.insert(tx.id.as_str()); }
+        for tx in &next {
+            remaining.remove(tx.id.as_str());
+            laid_out.insert(tx.id.as_str());
+        }
         columns.push(next);
     }
 
