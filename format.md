@@ -123,6 +123,8 @@ Output index is positional in the `outputs` array (`0`, `1`, ...), and is used b
 - `sequence` (optional):
   - integer: exact encoded input sequence, or
   - object form similar to locktime shorthands (e.g. height/time-oriented expression), normalized to a concrete integer sequence value.
+- `title` (string, optional): short always-visible label for the input when rendered.
+- `description` (string, optional): longer contextual text for tooltip/expanded metadata.
 
 Reference syntax shown in README:
 - `"<ref>:<output-index>"`, e.g. `"parent:0"`.
