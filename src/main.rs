@@ -1,6 +1,7 @@
 mod model;
 
 use std::{error::Error, fmt, fs, io::Write, path::PathBuf};
+use std::collections::{BTreeSet, HashMap};
 
 use clap::{Parser, ValueEnum};
 use serde_json::Value;
@@ -121,6 +122,8 @@ impl Default for RenderConfig {
 
 #[derive(Clone)]
 struct TxDoc {
+    id: String,
+    creation_index: usize,
     title: Option<String>,
     version: Option<i64>,
     locktime: Option<Value>,
@@ -128,11 +131,21 @@ struct TxDoc {
     outputs: Vec<OutputDoc>,
 }
 #[derive(Clone)]
-struct InputDoc {}
+struct InputDoc {
+    spends: Option<SpendRef>,
+}
 #[derive(Clone)]
 struct OutputDoc {
+    out_uid: String,
+    creation_index: usize,
     title: String,
     value: Option<String>,
+}
+
+#[derive(Clone)]
+struct SpendRef {
+    tx_ref: String,
+    vout: usize,
 }
 
 fn main() -> Result<(), CliError> {
@@ -192,6 +205,8 @@ fn write_output(request: &OperationRequest) -> Result<(), CliError> {
 
 fn parse_transactions(request: &OperationRequest) -> Result<Vec<TxDoc>, String> {
     let mut txs = Vec::new();
+    let mut tx_counter = 0usize;
+    let mut out_counter = 0usize;
     for doc in &request.inputs {
         let arr = doc
             .payload
@@ -199,6 +214,11 @@ fn parse_transactions(request: &OperationRequest) -> Result<Vec<TxDoc>, String> 
             .and_then(Value::as_array)
             .ok_or_else(|| format!("{} missing 'transactions' array", doc.source_path.display()))?;
         for tx in arr {
+            let tx_id = tx
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("tx_{tx_counter}"));
             let title = tx
                 .get("annotations")
                 .and_then(|a| a.get("title"))
@@ -210,7 +230,17 @@ fn parse_transactions(request: &OperationRequest) -> Result<Vec<TxDoc>, String> 
             let inputs = tx
                 .get("inputs")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().map(|_| InputDoc {}).collect())
+                .map(|a| {
+                    a.iter()
+                        .map(|i| {
+                            let spends = i
+                                .get("spends")
+                                .and_then(Value::as_str)
+                                .and_then(parse_spend_ref);
+                            InputDoc { spends }
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             let outputs = tx
                 .get("outputs")
@@ -237,21 +267,41 @@ fn parse_transactions(request: &OperationRequest) -> Result<Vec<TxDoc>, String> 
                                         .and_then(Value::as_str)
                                         .map(str::to_owned)
                                 });
-                            OutputDoc { title, value }
+                            let out_uid = format!("{tx_id}:{i}");
+                            let creation_index = out_counter;
+                            out_counter += 1;
+                            OutputDoc {
+                                out_uid,
+                                creation_index,
+                                title,
+                                value,
+                            }
                         })
                         .collect()
                 })
                 .unwrap_or_default();
             txs.push(TxDoc {
+                id: tx_id,
+                creation_index: tx_counter,
                 title,
                 version,
                 locktime,
                 inputs,
                 outputs,
             });
+            tx_counter += 1;
         }
     }
     Ok(txs)
+}
+
+fn parse_spend_ref(raw: &str) -> Option<SpendRef> {
+    let (tx_ref, vout_raw) = raw.rsplit_once(':')?;
+    let vout = vout_raw.parse::<usize>().ok()?;
+    Some(SpendRef {
+        tx_ref: tx_ref.to_owned(),
+        vout,
+    })
 }
 
 struct TextMeasurer;
@@ -275,26 +325,32 @@ fn emit_html(mut writer: impl Write, generator: &str, txs: &[TxDoc]) -> std::io:
 fn emit_svg(mut writer: impl Write, generator: &str, txs: &[TxDoc]) -> std::io::Result<()> {
     let cfg = RenderConfig::default();
     let m = TextMeasurer;
-    let mut y: f32 = 20.0;
+    let columns = build_layout_columns(txs).unwrap_or_else(|_| vec![txs.iter().collect()]);
+    let mut max_y: f32 = 0.0;
     let mut groups = String::new();
     let mut max_w: f32 = 0.0;
-    for tx in txs {
-        let (g, h, w) = layout_tx(tx, &cfg, &m, y);
-        y += h + cfg.tx_gap_y;
-        max_w = max_w.max(w + 40.0);
-        groups.push_str(&g);
+    for (column_idx, col) in columns.iter().enumerate() {
+        let mut y = 20.0;
+        let x = 20.0 + column_idx as f32 * (cfg.tx_max_width + 120.0);
+        for tx in col {
+            let (g, h, w) = layout_tx(tx, &cfg, &m, x, y);
+            y += h + cfg.tx_gap_y;
+            max_w = max_w.max(x + w + 40.0);
+            groups.push_str(&g);
+        }
+        max_y = max_y.max(y);
     }
     write!(
         writer,
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"{}\" height=\"{}\">\n  <metadata>{}</metadata>\n{}\n</svg>\n",
         max_w.max(200.0),
-        y.max(120.0),
+        max_y.max(120.0),
         html_escape::encode_text(generator),
         groups
     )
 }
 
-fn layout_tx(tx: &TxDoc, c: &RenderConfig, m: &TextMeasurer, top: f32) -> (String, f32, f32) {
+fn layout_tx(tx: &TxDoc, c: &RenderConfig, m: &TextMeasurer, left: f32, top: f32) -> (String, f32, f32) {
     let header = if tx.version.is_some() || tx.locktime.is_some() {
         c.line_height
     } else {
@@ -335,7 +391,6 @@ fn layout_tx(tx: &TxDoc, c: &RenderConfig, m: &TextMeasurer, top: f32) -> (Strin
             + (tx.outputs.len().saturating_sub(1) as f32) * c.output_row_gap
     };
     let tx_h = in_last.max(out_last) - top + c.io_bottom_margin;
-    let left = 20.0;
     let right = left + tx_w;
     let mut s = String::new();
     s.push_str("  <g class=\"tx\">\n");
@@ -379,6 +434,82 @@ fn layout_tx(tx: &TxDoc, c: &RenderConfig, m: &TextMeasurer, top: f32) -> (Strin
     (s, tx_h, tx_w)
 }
 
+fn build_layout_columns<'a>(txs: &'a [TxDoc]) -> Result<Vec<Vec<&'a TxDoc>>, String> {
+    let id_to_tx: HashMap<&str, &TxDoc> = txs.iter().map(|t| (t.id.as_str(), t)).collect();
+    let output_creation: HashMap<(String, usize), usize> = txs
+        .iter()
+        .flat_map(|tx| {
+            tx.outputs
+                .iter()
+                .enumerate()
+                .map(move |(vout, out)| ((tx.id.clone(), vout), out.creation_index))
+        })
+        .collect();
+
+    let mut remaining: BTreeSet<&str> = txs.iter().map(|t| t.id.as_str()).collect();
+    let mut laid_out: BTreeSet<&str> = BTreeSet::new();
+    let mut columns: Vec<Vec<&TxDoc>> = Vec::new();
+
+    let mut no_input: Vec<&TxDoc> = txs
+        .iter()
+        .filter(|tx| !tx.inputs.iter().any(|i| i.spends.as_ref().is_some_and(|s| id_to_tx.contains_key(s.tx_ref.as_str()))))
+        .collect();
+    no_input.sort_by_key(|t| t.creation_index);
+    for tx in &no_input {
+        remaining.remove(tx.id.as_str());
+        laid_out.insert(tx.id.as_str());
+    }
+    if !no_input.is_empty() { columns.push(no_input); }
+
+    while !remaining.is_empty() {
+        let mut candidate_ids: BTreeSet<&str> = BTreeSet::new();
+        for parent_id in &laid_out {
+            if let Some(parent) = id_to_tx.get(parent_id) {
+                for out in &parent.outputs {
+                    for tx in txs.iter().filter(|tx| {
+                        tx.inputs.iter().any(|i| i.spends.as_ref().is_some_and(|s| format!("{}:{}", s.tx_ref, s.vout) == out.out_uid))
+                    }) {
+                        if remaining.contains(tx.id.as_str()) { candidate_ids.insert(tx.id.as_str()); }
+                    }
+                }
+            }
+        }
+        let mut next: Vec<&TxDoc> = candidate_ids
+            .into_iter()
+            .filter_map(|id| id_to_tx.get(id).copied())
+            .filter(|tx| tx.inputs.iter().all(|i| i.spends.as_ref().is_none_or(|s| !id_to_tx.contains_key(s.tx_ref.as_str()) || laid_out.contains(s.tx_ref.as_str()))))
+            .collect();
+
+        if next.is_empty() {
+            return Err("unsatisfied transaction dependencies".to_string());
+        }
+
+        let tx_row: HashMap<&str, usize> = columns.iter().flatten().enumerate().map(|(i, tx)| (tx.id.as_str(), i)).collect();
+        next.sort_by_key(|tx| {
+            let spends_tx_key = tx
+                .inputs
+                .iter()
+                .filter_map(|i| i.spends.as_ref())
+                .filter_map(|s| tx_row.get(s.tx_ref.as_str()).copied())
+                .min()
+                .unwrap_or(usize::MAX);
+            let spends_out_key = tx
+                .inputs
+                .iter()
+                .filter_map(|i| i.spends.as_ref())
+                .filter_map(|s| output_creation.get(&(s.tx_ref.clone(), s.vout)).copied())
+                .min()
+                .unwrap_or(usize::MAX);
+            (spends_tx_key, spends_out_key, tx.creation_index)
+        });
+
+        for tx in &next { remaining.remove(tx.id.as_str()); laid_out.insert(tx.id.as_str()); }
+        columns.push(next);
+    }
+
+    Ok(columns)
+}
+
 fn format_generator_label(inputs: &[InputDocument]) -> String {
     let p = inputs
         .first()
@@ -393,11 +524,15 @@ mod tests {
     #[test]
     fn svg_contains_tx_group() {
         let tx = TxDoc {
+            id: "a".into(),
+            creation_index: 0,
             title: Some("A title".into()),
             version: Some(2),
             locktime: None,
-            inputs: vec![InputDoc {}],
+            inputs: vec![InputDoc { spends: None }],
             outputs: vec![OutputDoc {
+                out_uid: "a:0".into(),
+                creation_index: 0,
                 title: "out".into(),
                 value: Some("1 sat".into()),
             }],
@@ -412,13 +547,15 @@ mod tests {
     fn top_margin_collapse_uses_max() {
         let cfg = RenderConfig::default();
         let tx = TxDoc {
+            id: "a".into(),
+            creation_index: 0,
             title: None,
             version: Some(1),
             locktime: None,
-            inputs: vec![InputDoc {}],
+            inputs: vec![InputDoc { spends: None }],
             outputs: vec![],
         };
-        let (_svg, h, _w) = layout_tx(&tx, &cfg, &TextMeasurer, 20.0);
+        let (_svg, h, _w) = layout_tx(&tx, &cfg, &TextMeasurer, 20.0, 20.0);
         assert!(h > 0.0);
     }
 }
